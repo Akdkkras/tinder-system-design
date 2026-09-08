@@ -76,3 +76,7 @@ EU-27 выбран как единый регион: большая часть �
 
 4. Tinder. *Frequently Asked Questions — How do Tinder matches work?*  
    https://tinder.com/faq
+
+5. Tinder. *Regulatory disclosures — European Digital Services Act: Average Monthly Active Recipients*.  
+   https://policies.tinder.com/community/additional-information/disclosures/intl/en/?utm_source=chatgpt.com
+   
