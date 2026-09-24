@@ -442,6 +442,226 @@ Match за первый год:
 
 Полученная разбивка показывает, что фотографии являются существенным источником сетевой нагрузки.
 
+## 3. Глобальная балансировка нагрузки
+
+Целевая аудитория сервиса размещена в EU-27. В разделе определяется схема глобальной доставки динамических API-запросов и фотографий профилей, а также необходимость географического распределения API между несколькими регионами.
+
+### 3.1. Исходные данные
+
+Для проектирования используются результаты раздела 2:
+
+| Метрика | Значение |
+|---|---:|
+| Целевая аудитория | EU-27 |
+| MAU | 15 млн |
+| DAU | 5,415 млн |
+| Средний внешний API RPS | ≈8 856 |
+| Пиковый внешний API RPS | ≈16 384 |
+| Пиковый Like/Pass RPS | ≈14 683 |
+| Пиковый Discovery RPS | ≈587 |
+| Пиковый Location Update RPS | ≈557 |
+| Пиковый Match List RPS | ≈557 |
+| Общий пиковый сетевой трафик | ≈16,27 Гбит/с |
+| Минимальный пиковый трафик первых фотографий Discovery | ≈7,52 Гбит/с |
+
+Доля Like/Pass в пиковом внешнем API-трафике:
+
+`14 683 / 16 384 ≈ 89,6%`
+
+Следовательно, основная API-нагрузка имеет write-heavy профиль.
+
+### 3.2. Функциональное разбиение по доменам
+
+Используются два публичных домена:
+
+| Домен | Назначение | Тип нагрузки | Глобальная доставка |
+|---|---|---|---|
+| `api.example.com` | Discovery, Like/Pass, Location Update, Match List, профиль | динамические персонализированные запросы | один активный регион Frankfurt |
+| `media.example.com` | фотографии профилей | статический кэшируемый контент | CDN + Anycast |
+
+Фотографии выносятся в CDN, поскольку CDN хранит копии контента на географически распределённых edge-узлах, уменьшая задержку доставки и нагрузку на origin [29].
+
+### 3.3. Выбор количества активных регионов API
+
+Необходимость multi-region оценивается по четырём критериям:
+
+- задержка до пользователя;
+- рассчитанная нагрузка;
+- стоимость и эксплуатационная сложность;
+- отказоустойчивость.
+
+#### 3.3.1. Модель географического распределения
+
+Публичная статистика распределения Tinder MAU по всем странам EU-27 отсутствует. Для сравнительной модели используется население стран EU-27 как proxy географического распределения аудитории.
+
+По данным Eurostat, крупнейшими странами EU по населению являются Германия, Франция, Италия, Испания и Польша; суммарно на них приходится около 66% населения EU [21].
+
+В качестве кандидатов на размещение регионов рассматриваются европейские инфраструктурные локации Frankfurt, Paris, Milan, Madrid, Stockholm и Dublin, соответствующие географиям существующих облачных регионов [22].
+
+Для оценки каждая страна представлена своей столицей и назначается ближайшему из выбранных регионов по расстоянию по дуге большого круга.
+
+#### 3.3.2. Оценка RTT
+
+Для оценки сетевой задержки использованы публичные ICMP ping-измерения WonderNetwork [23–28]. По ним построена линейная planning-модель:
+
+`RTT_ms ≈ 0,73 + 0,0248 × distance_km`
+
+Модель используется только для сравнительной оценки вариантов. Реальный RTT зависит от ISP, BGP-маршрутизации, peering, мобильной сети и текущего состояния каналов.
+
+#### 3.3.3. Сравнение вариантов
+
+Для каждого варианта сначала для каждой страны выбирается ближайший активный регион по оценочному RTT. Затем средний RTT рассчитывается как средневзвешенное значение по населению стран:
+
+`RTT_avg = Σ(P_i × min(RTT_i1, RTT_i2, ..., RTT_in)) / ΣP_i`,
+
+где `P_i` — население страны, используемое как proxy доли аудитории, а `RTT_ij` — оценочный RTT от столицы страны `i` до региона `j` по модели из п. 3.3.2. Значение p95 определяется по накопленной доле населения после сортировки стран по рассчитанному RTT: это RTT, ниже которого находится примерно 95% proxy-аудитории.
+
+Таким образом, приведённые ниже значения являются результатом расчёта по единой модели для EU-27, а не отдельными значениями из внешнего источника. Для вариантов с двумя и тремя регионами выбраны комбинации кандидатов, дающие минимальный средневзвешенный RTT в рассматриваемом наборе локаций.
+
+| Вариант | Активные регионы | Оценочный средневзвешенный RTT | Оценочный population-weighted p95 RTT | Выигрыш среднего RTT относительно 1 региона |
+|---|---|---:|---:|---:|
+| 1 регион | Frankfurt | ≈21,8 мс | ≈41,6 мс | — |
+| 2 региона | Frankfurt + Madrid | ≈17,1 мс | ≈36,8 мс | ≈4,7 мс |
+| 3 региона | Frankfurt + Madrid + Milan | ≈15,0 мс | ≈33,8 мс | ≈6,8 мс |
+
+Добавление второго региона уменьшает оценочный средний RTT примерно на `4,7 мс`, трёх регионов относительно одного — примерно на `6,8 мс`.
+
+Для интерактивных интерфейсов Google RAIL использует ориентир порядка 100 мс от пользовательского ввода до видимой реакции [31]. Полученный выигрыш RTT не является достаточным основанием для усложнения API до active-active multi-region.
+
+Дополнительно наиболее тяжёлый по объёму пользовательский контент — фотографии — обслуживается через CDN и не требует прохождения каждого запроса через основной API-регион.
+
+### 3.4. Обоснование выбранной топологии API
+
+Принята архитектура **одного активного региона Frankfurt с размещением компонентов в нескольких Availability Zones**.
+
+Причины отказа от active-active multi-region:
+
+1. **Незначительный выигрыш RTT.** Два региона уменьшают оценочный средний RTT на `≈4,7 мс`, три — на `≈6,8 мс` относительно одного региона.
+2. **Write-heavy профиль.** Like/Pass формирует `≈89,6%` пикового внешнего API-трафика. Active-active запись требует межрегиональной репликации, идемпотентности, разрешения конфликтов и дополнительной логики маршрутизации. Для write-intensive workloads AWS рекомендует primary Region и standby Region вместо обязательной active-active схемы [35].
+3. **Рост стоимости и эксплуатационной сложности.** Multi-region требует дублирования региональной инфраструктуры, репликации данных, мониторинга и процедур failover/failback. AWS указывает, что полностью развёрнутый hot-standby фактически удваивает стоимость workload [34].
+4. **Требования по отказоустойчивости можно частично закрыть Multi-AZ.** Availability Zones являются независимыми площадками внутри региона. Frankfurt (`eu-central-1`) имеет три AZ [22]. AWS рекомендует Multi-AZ для production workloads и указывает, что multi-region следует вводить при наличии требований, которые нельзя закрыть одним отказоустойчивым регионом [33].
+
+В предыдущих разделах не задан RTO/RPO, требующий автоматического переживания полного отказа региона. Поэтому active-active multi-region не используется.
+
+### 3.5. Выбор расположения активного региона
+
+Активный регион размещается во **Frankfurt**.
+
+Основания:
+
+- Frankfurt даёт минимальный средневзвешенный RTT среди рассмотренных кандидатов в используемой population-weighted модели;
+- Германия является крупнейшей страной EU по населению; значительная часть населения EU сосредоточена в Центральной, Западной и Южной Европе [21];
+- Frankfurt является крупным европейским сетевым узлом; DE-CIX характеризует Frankfurt как крупнейшую Internet Exchange в Европе [35];
+- регион поддерживает Multi-AZ размещение; AWS `eu-central-1` содержит три Availability Zones [22].
+
+Frankfurt выбран как компромисс между географическим положением относительно EU-27, сетевой связностью и доступностью отказоустойчивой инфраструктуры.
+
+### 3.6. DNS-балансировка
+
+#### API
+
+GeoDNS для `api.example.com` не используется, так как активный API-регион один.
+
+```text
+User
+  |
+  v
+DNS: api.example.com
+  |
+  v
+Frankfurt regional entry point
+  |
+  v
+Local load balancing / API
+```
+
+DNS выполняет обычное разрешение имени в адрес региональной входной точки. Распределение между AZ и backend-инстансами относится к локальной балансировке и рассматривается в разделе 4.
+
+#### Media
+
+`media.example.com` направляется на инфраструктуру CDN:
+
+```text
+media.example.com -> CDN provider
+```
+
+Далее выбор edge-узла выполняется Anycast/BGP-маршрутизацией CDN.
+
+### 3.7. Anycast-балансировка media
+
+```text
+User
+  |
+  | DNS
+  v
+media.example.com
+  |
+  v
+CDN Anycast IP
+  |
+  | BGP routing
+  v
+CDN edge / PoP
+  |
+  +-- cache HIT --> photo
+  |
+  +-- cache MISS --> media origin in Frankfurt --> photo storage
+```
+
+При Anycast один IP-префикс анонсируется из нескольких точек CDN-сети. BGP направляет пользовательский трафик в выбранный PoP [30]. Географически ближайший PoP не гарантируется, поскольку результат зависит от peering, BGP-политик и traffic engineering [32].
+
+`origin` — инфраструктура сервиса во Frankfurt, содержащая исходный объект. CDN edge выполняет кэширование и проксирование запросов к origin [30].
+
+Собственный Anycast для `api.example.com` не используется, поскольку отсутствует необходимость выбора между несколькими активными API-регионами.
+
+### 3.8. Механизм регулировки трафика между дата-центрами
+
+Для API межрегиональная балансировка отсутствует:
+
+`100% API traffic -> Frankfurt`
+
+Отказ отдельной AZ обрабатывается средствами локальной балансировки и резервирования внутри Frankfurt-региона.
+
+Для media географическое распределение выполняется CDN-провайдером. При cache hit запрос обслуживается edge-узлом; при cache miss CDN получает объект из origin во Frankfurt.
+
+### 3.9. Итоговая схема
+
+```text
+                              EU-27 users
+                                   |
+                    +--------------+--------------+
+                    |                             |
+                    v                             v
+             api.example.com              media.example.com
+                    |                             |
+                   DNS                           DNS
+                    |                             |
+                    v                             v
+          Frankfurt active region          CDN Anycast network
+             /       |       \             /      |       \
+           AZ-1    AZ-2     AZ-3          PoP     PoP      PoP
+             \       |       /              \      |       /
+              \      |      /                cache / proxy
+               +-----+-----+                       |
+                     |                     cache miss only
+                     v                             |
+               API / backend <--------------------+
+                     |
+                     v
+                data storage
+```
+
+Принятые решения:
+
+- `api.example.com` обслуживается одним активным регионом Frankfurt;
+- отказоустойчивость внутри региона обеспечивается Multi-AZ размещением;
+- GeoDNS для API не используется;
+- `media.example.com` обслуживается глобальным CDN;
+- выбор CDN PoP выполняется через Anycast/BGP;
+- media origin размещается во Frankfurt;
+- active-active multi-region для API не используется из-за малого выигрыша RTT при существенном росте сложности write-path и эксплуатации;
+- необходимость второго резервного региона определяется в разделе надёжности после задания RTO/RPO.
+
 ---
 
 ## Источники
@@ -505,4 +725,48 @@ Match за первый год:
 
 20. Sim Local. *How Much Data Does Tinder and Bumble Use?*, 05.02.2025.  
     https://www.simlocal.com/post/how-much-data-does-bumble-tinder-use
-    
+
+21. Eurostat. *Demography of Europe — 2025 edition*.  
+    https://ec.europa.eu/eurostat/en/web/interactive-publications/demography-2025
+
+22. AWS. *AWS Regions and Availability Zones*.  
+    https://docs.aws.amazon.com/global-infrastructure/latest/regions/aws-regions-availability-zones.html
+
+23. WonderNetwork. *Global Ping Statistics*.  
+    https://wondernetwork.com/pings
+
+24. WonderNetwork. *Ping time between Frankfurt and Valencia*.  
+    https://wondernetwork.com/pings/Frankfurt/Valencia
+
+25. WonderNetwork. *Ping time between Nuremberg and Warsaw*.  
+    https://wondernetwork.com/pings/Nuremberg/Warsaw
+
+26. WonderNetwork. *Ping time between Rome and Athens*.  
+    https://wondernetwork.com/pings/Rome/Athens
+
+27. WonderNetwork. *Ping time between Rome and Falkenstein*.  
+    https://wondernetwork.com/pings/Rome/Falkenstein
+
+28. WonderNetwork. *Ping time between Helsinki and Stockholm*.  
+    https://wondernetwork.com/pings/Helsinki/Stockholm
+
+29. Cloudflare. *Cache*.  
+    https://developers.cloudflare.com/cache/
+
+30. Cloudflare. *TCP connections — How Cloudflare connects user to origin*.  
+    https://developers.cloudflare.com/fundamentals/reference/tcp-connections/
+
+31. web.dev. *Measure performance with the RAIL model*.  
+    https://web.dev/articles/rail
+
+32. Cloudflare. *Cloudflare traffic not being sent to the geographically closest data center*.  
+    https://developers.cloudflare.com/support/troubleshooting/general-troubleshooting/geographic-traffic-routing/
+
+33. AWS Well-Architected Framework. *REL10-BP02 Select the appropriate locations for your multi-location deployment*.  
+    https://docs.aws.amazon.com/wellarchitected/2024-06-27/framework/rel_fault_isolation_select_location.html
+
+34. AWS Prescriptive Guidance. *Multi-Region fundamental 1: Understanding the requirements*.  
+    https://docs.aws.amazon.com/prescriptive-guidance/latest/aws-multi-region-fundamentals/fundamental-1.html
+
+35. DE-CIX. *Global data traffic volume hits record-breaking 79 exabytes at Internet Exchanges in 2025*, 20.01.2026.  
+    https://www.de-cix.net/en/about-de-cix/media/press-releases/de-cix-global-data-traffic-volume-hits-record-breaking-79-exabytes-at-internet-exchanges-in-2025
